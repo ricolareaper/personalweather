@@ -56,125 +56,252 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin></script>
 
-  <script>
-    let radarMap, radarLayer, radarInterval, frameIndex=0, frames=[], times=[];
+<script>
+  let radarMap, radarLayer, radarInterval, frameIndex=0, frames=[], times=[];
 
-    async function loadByCity() {
-      const city = document.getElementById('cityInput').value.trim();
-      /*if (!city) return alert('Enter a city name.');*/
+  // --- Helpers for input parsing and result ranking ---
+  const US_STATE_BY_ABBR = {
+    AL:"Alabama", AK:"Alaska", AZ:"Arizona", AR:"Arkansas", CA:"California",
+    CO:"Colorado", CT:"Connecticut", DE:"Delaware", FL:"Florida", GA:"Georgia",
+    HI:"Hawaii", ID:"Idaho", IL:"Illinois", IN:"Indiana", IA:"Iowa",
+    KS:"Kansas", KY:"Kentucky", LA:"Louisiana", ME:"Maine", MD:"Maryland",
+    MA:"Massachusetts", MI:"Michigan", MN:"Minnesota", MS:"Mississippi", MO:"Missouri",
+    MT:"Montana", NE:"Nebraska", NV:"Nevada", NH:"New Hampshire", NJ:"New Jersey",
+    NM:"New Mexico", NY:"New York", NC:"North Carolina", ND:"North Dakota", OH:"Ohio",
+    OK:"Oklahoma", OR:"Oregon", PA:"Pennsylvania", RI:"Rhode Island", SC:"South Carolina",
+    SD:"South Dakota", TN:"Tennessee", TX:"Texas", UT:"Utah", VT:"Vermont",
+    VA:"Virginia", WA:"Washington", WV:"West Virginia", WI:"Wisconsin", WY:"Wyoming",
+    DC:"District of Columbia"
+  };
+  const COUNTRY_ALIASES = { UK:"GB" }; // normalize common aliases
 
-      const geo = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1`).then(r => r.json());
-      /*if (!geo.results || geo.results.length === 0) return alert('City not found.');*/
+  function parseLocationInput(raw) {
+    // Accept: "City", "City ST", "City, ST", "City State", "City, State", also country codes/names
+    const input = raw.trim().replace(/\s{2,}/g, " ");
+    if (!input) return { cityQuery: "", stateName: null, countryCode: null };
 
-      const { latitude, longitude } = geo.results[0];
-      const url = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}` +
-                  `&hourly=temperature_2m,precipitation_probability,relative_humidity_2m,apparent_temperature` +
-                  `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
-                  `&past_hours=2&forecast_hours=4&timezone=auto&temperature_unit=fahrenheit`;
-      const data = await fetch(url).then(r => r.json());
+    // Split by comma if present, else by spaces for the trailing region bit
+    let cityPart = input, regionPart = "";
 
-      renderHourly(data.hourly);
-      renderDaily(data.daily);
-      setupRadarMap(latitude, longitude, city); // pass city here
-    }
-
-    function renderHourly(h) {
-      const dv = document.getElementById('hourlySlider'); dv.innerHTML = '';
-      h.time.forEach((t,i) => {
-        const ts = new Date(t).toLocaleString('en-US',{weekday:'short', hour:'numeric', hour12:true});
-        const temp = Math.round(h.temperature_2m[i]) + '°F';
-        const rain = h.precipitation_probability[i] + '%';
-        const hi = Math.round(h.apparent_temperature[i]) + '°F';
-        dv.append(Object.assign(document.createElement('div'), {
-          className: 'card',
-          innerHTML: `<div class="time">${ts}</div><div>${temp}</div><div>Rain: ${rain}</div><div>Feels: ${hi}</div>`
-        }));
-      });
-    }
-
-    function renderDaily(d) {
-      const dv = document.getElementById('dailySlider'); dv.innerHTML = '';
-      d.time.forEach((dstr,i) => {
-        const day = new Date(dstr).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'});
-        const hi = Math.round(d.temperature_2m_max[i]) + '°F';
-        const lo = Math.round(d.temperature_2m_min[i]) + '°F';
-        const rain = d.precipitation_probability_max[i] + '%';
-        dv.append(Object.assign(document.createElement('div'), {
-          className: 'card',
-          innerHTML: `<div class="time">${day}</div><div>Hi: ${hi}</div><div>Lo: ${lo}</div><div>Rain: ${rain}</div>`
-        }));
-      });
-    }
-
-    function setupRadarMap(lat, lon, city) {
-      if (!radarMap) {
-        radarMap = L.map('radarMap').setView([lat, lon], 6);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution: '&copy; OpenStreetMap contributors'
-        }).addTo(radarMap);
+    if (input.includes(",")) {
+      const parts = input.split(",").map(s => s.trim()).filter(Boolean);
+      cityPart = parts.shift() || "";
+      regionPart = (parts.join(" ") || "").trim(); // can contain "State" and/or "Country"
+    } else {
+      // Heuristic: last token is region (state/country); the rest is city
+      const tokens = input.split(" ");
+      if (tokens.length > 1) {
+        regionPart = tokens.pop();
+        cityPart = tokens.join(" ");
       }
+    }
 
-      radarMap.setView([lat, lon], 8);
-      if (window.cityMarker) radarMap.removeLayer(window.cityMarker);
-      window.cityMarker = L.marker([lat, lon]).addTo(radarMap).bindPopup(city).openPopup(); // <-- city name here
+    // Try to detect state (abbr or full) and/or country from regionPart
+    let stateName = null, countryCode = null;
 
-      const now = Math.floor(Date.now()/1000);
-      times = [];
-      for (let i=-2; i<=0; i++) { times.push(now + i*3600); }
+    if (regionPart) {
+      const regionTokens = regionPart.split(/\s+/);
+      // Check two-letter upper-case (state or country)
+      const maybeTwo = regionTokens[0].toUpperCase();
 
-      frames = times.map(t => {
-        const date = new Date(t*1000);
-        const yyyy = date.getUTCFullYear();
-        const mm = String(date.getUTCMonth()+1).padStart(2,'0');
-        const dd = String(date.getUTCDate()).padStart(2,'0');
-        const hh = String(date.getUTCHours()).padStart(2,'0');
+      if (US_STATE_BY_ABBR[maybeTwo]) {
+        stateName = US_STATE_BY_ABBR[maybeTwo];
+        countryCode = "US";
+      } else if (maybeTwo.length === 2) {
+        countryCode = COUNTRY_ALIASES[maybeTwo] || maybeTwo;
+      } else {
+        // Check full state names (case-insensitive)
+        const matchState = Object.values(US_STATE_BY_ABBR).find(
+          s => s.toLowerCase() === regionPart.toLowerCase()
+        );
+        if (matchState) {
+          stateName = matchState;
+          countryCode = "US";
+        } else {
+          // If it looks like a country name or code; keep as country guess
+          // (Open-Meteo returns country_code in results; we’ll match there.)
+          // For simplicity we only map UK->GB above; others rely on results.
+          countryCode = null;
+        }
+      }
+    }
 
-        return L.tileLayer(`https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q/{z}/{x}/{y}.png?year=${yyyy}&month=${mm}&day=${dd}&hour=${hh}`, {
-          opacity: 0.6,
-          attribution: 'Radar © Iowa State University / NWS'
-        });
+    return { cityQuery: cityPart.trim(), stateName, countryCode };
+  }
+
+  function rankResult(r, opts) {
+    const { stateName, countryCode, preferCountry } = opts;
+    let score = 0;
+
+    // Exact state match gets a big boost
+    if (stateName && r.admin1 && r.admin1.toLowerCase() === stateName.toLowerCase()) score += 1000;
+
+    // Country match (typed) gets high boost
+    if (countryCode && r.country_code === countryCode) score += 500;
+
+    // If no country typed, prefer user's region (e.g., US for America/* timezones)
+    if (!countryCode && preferCountry && r.country_code === preferCountry) score += 120;
+
+    // Prefer city feature types (Open-Meteo uses feature_code like PPLA, PPLA2, PPL)
+    if (r.feature_code && /^PPL/.test(r.feature_code)) score += 20;
+
+    // Population as a soft tiebreaker
+    score += (r.population || 0) / 1_000_000;
+
+    return score;
+  }
+
+  async function loadByCity() {
+    const raw = document.getElementById('cityInput').value.trim();
+    if (!raw) return; // do nothing on empty input
+
+    const { cityQuery, stateName, countryCode } = parseLocationInput(raw);
+    if (!cityQuery) return;
+
+    // Prefer US if the browser timezone is in the Americas and the user didn’t type a country
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+    const preferCountry = (!countryCode && /^America\//.test(tz)) ? "US" : null;
+
+    // Ask for multiple candidates, we’ll filter/rank client-side
+    const geo = await fetch(
+      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(cityQuery)}&count=10&language=en`
+    ).then(r => r.json()).catch(() => null);
+
+    if (!geo || !geo.results || geo.results.length === 0) {
+      alert('City not found. Try adding a state or country.');
+      return;
+    }
+
+    // Filter to country/state if user specified
+    let candidates = geo.results.slice();
+
+    if (countryCode) {
+      candidates = candidates.filter(r => r.country_code === countryCode) || candidates;
+    }
+    if (stateName) {
+      const stateMatches = candidates.filter(r => r.admin1 && r.admin1.toLowerCase() === stateName.toLowerCase());
+      if (stateMatches.length) candidates = stateMatches;
+    }
+
+    // Rank remaining candidates
+    candidates.sort((a, b) =>
+      rankResult(b, { stateName, countryCode, preferCountry }) - rankResult(a, { stateName, countryCode, preferCountry })
+    );
+
+    const match = candidates[0];
+    const { latitude, longitude } = match;
+    const displayName = match.name;
+
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}` +
+                `&hourly=temperature_2m,precipitation_probability,relative_humidity_2m,apparent_temperature` +
+                `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
+                `&past_hours=2&forecast_hours=4&timezone=auto&temperature_unit=fahrenheit`;
+
+    const data = await fetch(url).then(r => r.json());
+    renderHourly(data.hourly);
+    renderDaily(data.daily);
+    setupRadarMap(latitude, longitude, displayName);
+  }
+
+  function renderHourly(h) {
+    const dv = document.getElementById('hourlySlider'); dv.innerHTML = '';
+    h.time.forEach((t,i) => {
+      const ts = new Date(t).toLocaleString('en-US',{weekday:'short', hour:'numeric', hour12:true});
+      const temp = Math.round(h.temperature_2m[i]) + '°F';
+      const rain = h.precipitation_probability[i] + '%';
+      const hi = Math.round(h.apparent_temperature[i]) + '°F';
+      dv.append(Object.assign(document.createElement('div'), {
+        className: 'card',
+        innerHTML: `<div class="time">${ts}</div><div>${temp}</div><div>Rain: ${rain}</div><div>Feels: ${hi}</div>`
+      }));
+    });
+  }
+
+  function renderDaily(d) {
+    const dv = document.getElementById('dailySlider'); dv.innerHTML = '';
+    d.time.forEach((dstr,i) => {
+      const day = new Date(dstr).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'});
+      const hi = Math.round(d.temperature_2m_max[i]) + '°F';
+      const lo = Math.round(d.temperature_2m_min[i]) + '°F';
+      const rain = d.precipitation_probability_max[i] + '%';
+      dv.append(Object.assign(document.createElement('div'), {
+        className: 'card',
+        innerHTML: `<div class="time">${day}</div><div>Hi: ${hi}</div><div>Lo: ${lo}</div><div>Rain: ${rain}</div>`
+      }));
+    });
+  }
+
+  function setupRadarMap(lat, lon, label) {
+    if (!radarMap) {
+      radarMap = L.map('radarMap').setView([lat, lon], 6);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors'
+      }).addTo(radarMap);
+    }
+
+    radarMap.setView([lat, lon], 8);
+    if (window.cityMarker) radarMap.removeLayer(window.cityMarker);
+    window.cityMarker = L.marker([lat, lon]).addTo(radarMap).bindPopup(label).openPopup();
+
+    const now = Math.floor(Date.now()/1000);
+    times = [];
+    for (let i=-2; i<=0; i++) { times.push(now + i*3600); }
+
+    frames = times.map(t => {
+      const date = new Date(t*1000);
+      const yyyy = date.getUTCFullYear();
+      const mm = String(date.getUTCMonth()+1).padStart(2,'0');
+      const dd = String(date.getUTCDate()).padStart(2,'0');
+      const hh = String(date.getUTCHours()).padStart(2,'0');
+
+      return L.tileLayer(`https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q/{z}/{x}/{y}.png?year=${yyyy}&month=${mm}&day=${dd}&hour=${hh}`, {
+        opacity: 0.6,
+        attribution: 'Radar © Iowa State University / NWS'
       });
+    });
 
-      frameIndex = 0;
-      document.getElementById('radarSlider').max = frames.length - 1;
+    frameIndex = 0;
+    document.getElementById('radarSlider').max = frames.length - 1;
+    if (radarLayer) radarMap.removeLayer(radarLayer);
+    radarLayer = frames[frameIndex].addTo(radarMap);
+    updateRadarTime();
+
+    const slider = document.getElementById('radarSlider');
+    slider.value = frameIndex;
+    slider.oninput = function() {
+      if (radarInterval) stopRadar();
+      radarMap.removeLayer(radarLayer);
+      frameIndex = parseInt(this.value, 10);
       radarLayer = frames[frameIndex].addTo(radarMap);
       updateRadarTime();
+    };
+  }
 
-      // Slider interaction
-      const slider = document.getElementById('radarSlider');
-      slider.value = frameIndex;
-      slider.oninput = function() {
-        if (radarInterval) stopRadar(); // stop autoplay when user scrubs
-        radarMap.removeLayer(radarLayer);
-        frameIndex = parseInt(this.value);
-        radarLayer = frames[frameIndex].addTo(radarMap);
-        updateRadarTime();
-      };
-    }
+  function updateRadarTime() {
+    const time = new Date(times[frameIndex]*1000);
+    document.getElementById('radarTime').innerText =
+      time.toLocaleString('en-US', {weekday:'short', month:'short', day:'numeric', hour:'numeric', minute:'numeric', hour12:true});
+    document.getElementById('radarSlider').value = frameIndex;
+  }
 
-    function updateRadarTime() {
-      const time = new Date(times[frameIndex]*1000);
-      document.getElementById('radarTime').innerText =
-        time.toLocaleString('en-US', {weekday:'short', month:'short', day:'numeric', hour:'numeric', minute:'numeric', hour12:true});
-      document.getElementById('radarSlider').value = frameIndex
-    }
+  function startRadar() {
+    if (radarInterval) return;
+    radarInterval = setInterval(()=>{
+      radarMap.removeLayer(radarLayer);
+      frameIndex = (frameIndex + 1) % frames.length;
+      radarLayer = frames[frameIndex].addTo(radarMap);
+      updateRadarTime();
+    }, 1000);
+  }
 
-    function startRadar() {
-      if (radarInterval) return;
-      radarInterval = setInterval(()=>{
-        radarMap.removeLayer(radarLayer);
-        frameIndex = (frameIndex + 1) % frames.length;
-        radarLayer = frames[frameIndex].addTo(radarMap);
-        updateRadarTime();
-      }, 1000);
-    }
+  function stopRadar() {
+    clearInterval(radarInterval);
+    radarInterval = null;
+  }
 
-    function stopRadar() {
-      clearInterval(radarInterval);
-      radarInterval = null;
-    }
+  // Optional: don't auto-load on empty input; user will type a city.
+  // loadByCity();
+</script>
 
-    loadByCity();
-  </script>
 </body>
 </html>
